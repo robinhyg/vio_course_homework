@@ -5,13 +5,15 @@
 #include "backend/problem.h"
 #include "utility/tic_toc.h"
 
-#ifdef USE_OPENMP
+// #ifdef USE_OPENMP
 
 #include <omp.h>
 
-#endif
+// #endif
 
 using namespace std;
+
+const int NUM_THREADS = 8;
 
 // define the format you want, you only need one instance of this...
 const static Eigen::IOFormat CSVFormat(Eigen::StreamPrecision, Eigen::DontAlignCols, ", ", "\n");
@@ -195,7 +197,7 @@ bool Problem::Solve(int iterations) {
         bool oneStepSuccess = false;
         int false_cnt = 0;
 
-        sd_step = (b_.transpose()*b_)/(b_.transpose()*Hessian_*b_) * b_;
+        sd_step = (b_.transpose()*b_).value()/(b_.transpose()*Hessian_*b_).value() * b_;
         GNcomputed = false;
 
         while (!oneStepSuccess && false_cnt < 10)  // 不断尝试, 直到成功迭代一步
@@ -336,6 +338,112 @@ bool Problem::CheckOrdering() {
     }
     return true;
 }
+
+
+void Problem::MakeHessian_parallel() {
+    TicToc t_h;
+    // 直接构造大的 H 矩阵
+    ulong size = ordering_generic_;
+
+    MatXX H[NUM_THREADS];
+    VecX b[NUM_THREADS];
+
+    for(size_t i=0; i<NUM_THREADS; i++)
+    {
+        H[i] = MatXX::Zero(size, size);
+        b[i] = VecX::Zero(size);
+    }
+    Hessian_ = MatXX::Zero(size, size);
+    b_ = VecX::Zero(size);
+
+    // TODO:: accelate, accelate, accelate
+
+    #pragma omp parallel for num_threads(NUM_THREADS)
+    for (auto edge = edges_.cbegin(); edge != edges_.cend(); ++edge) {
+    //for (auto &edge: edges_) {
+
+        int thread_id = omp_get_thread_num();
+
+        edge->second->ComputeResidual();
+        edge->second->ComputeJacobians();
+
+        // TODO:: robust cost
+        auto jacobians = edge->second->Jacobians();
+        auto verticies = edge->second->Verticies();
+        assert(jacobians.size() == verticies.size());
+        for (size_t i = 0; i < verticies.size(); ++i) {
+            auto v_i = verticies[i];
+            if (v_i->IsFixed()) continue;    // Hessian 里不需要添加它的信息，也就是它的雅克比为 0
+
+            auto jacobian_i = jacobians[i];
+            ulong index_i = v_i->OrderingId();
+            ulong dim_i = v_i->LocalDimension();
+
+            // 鲁棒核函数会修改残差和信息矩阵，如果没有设置 robust cost function，就会返回原来的
+            double drho;
+            MatXX robustInfo(edge->second->Information().rows(),edge->second->Information().cols());
+            edge->second->RobustInfo(drho,robustInfo);
+
+            MatXX JtW = jacobian_i.transpose() * robustInfo;
+            for (size_t j = i; j < verticies.size(); ++j) {
+                auto v_j = verticies[j];
+
+                if (v_j->IsFixed()) continue;
+
+                auto jacobian_j = jacobians[j];
+                ulong index_j = v_j->OrderingId();
+                ulong dim_j = v_j->LocalDimension();
+
+                assert(v_j->OrderingId() != -1);
+                MatXX hessian = JtW * jacobian_j;
+
+                // 所有的信息矩阵叠加起来
+                H[thread_id].block(index_i, index_j, dim_i, dim_j).noalias() += hessian;
+                if (j != i) {
+                    // 对称的下三角
+                    H[thread_id].block(index_j, index_i, dim_j, dim_i).noalias() += hessian.transpose();
+
+                }
+            }
+            b[thread_id].segment(index_i, dim_i).noalias() -= drho * jacobian_i.transpose()* edge->second->Information() * edge->second->Residual();
+        }
+
+    }
+
+    for(size_t i=0; i<NUM_THREADS; i++)
+    {
+        Hessian_ += H[i];
+        b_ -= b[i];
+    }
+    
+    t_hessian_cost_ += t_h.toc();
+
+    if(H_prior_.rows() > 0)
+    {
+        MatXX H_prior_tmp = H_prior_;
+        VecX b_prior_tmp = b_prior_;
+
+        /// 遍历所有 POSE 顶点，然后设置相应的先验维度为 0 .  fix 外参数, SET PRIOR TO ZERO
+        /// landmark 没有先验
+        for (auto vertex: verticies_) {
+            if (IsPoseVertex(vertex.second) && vertex.second->IsFixed() ) {
+                int idx = vertex.second->OrderingId();
+                int dim = vertex.second->LocalDimension();
+                H_prior_tmp.block(idx,0, dim, H_prior_tmp.cols()).setZero();
+                H_prior_tmp.block(0,idx, H_prior_tmp.rows(), dim).setZero();
+                b_prior_tmp.segment(idx,dim).setZero();
+//                std::cout << " fixed prior, set the Hprior and bprior part to zero, idx: "<<idx <<" dim: "<<dim<<std::endl;
+            }
+        }
+        Hessian_.topLeftCorner(ordering_poses_, ordering_poses_) += H_prior_tmp;
+        b_.head(ordering_poses_) += b_prior_tmp;
+    }
+
+    delta_x_ = VecX::Zero(size);  // initial delta_x = 0_n;
+
+
+}
+
 
 void Problem::MakeHessian() {
     TicToc t_h;

@@ -105,6 +105,7 @@ private:
 
     /// 构造大H矩阵
     void MakeHessian();
+    void MakeHessian_parallel();
 
     /// schur求解SBA
     void SchurSBA();
