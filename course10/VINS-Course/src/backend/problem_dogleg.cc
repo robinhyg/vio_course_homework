@@ -5,11 +5,11 @@
 #include "backend/problem.h"
 #include "utility/tic_toc.h"
 
-// #ifdef USE_OPENMP
+#define USE_OPENMP
 
+#ifdef USE_OPENMP
 #include <omp.h>
-
-// #endif
+#endif
 
 using namespace std;
 
@@ -185,7 +185,13 @@ bool Problem::Solve(int iterations) {
     // 统计优化变量的维数，为构建 H 矩阵做准备
     SetOrdering();
     // 遍历edge, 构建 H 矩阵
+    #ifdef USE_OPENMP
+    MakeHessian_parallel();
+    #endif
+
+    #ifndef USE_OPENMP
     MakeHessian();
+    #endif
     // LM 初始化
     ComputeLambdaInit();
     // LM 算法迭代求解
@@ -255,7 +261,13 @@ bool Problem::Solve(int iterations) {
 //                std::cout << " get one step success\n";
 
                 // 在新线性化点 构建 hessian
+                #ifdef USE_OPENMP
+                MakeHessian_parallel();
+                #endif
+
+                #ifndef USE_OPENMP
                 MakeHessian();
+                #endif
                 // TODO:: 这个判断条件可以丢掉，条件 b_max <= 1e-12 很难达到，这里的阈值条件不应该用绝对值，而是相对值
 //                double b_max = 0.0;
 //                for (int i = 0; i < b_.size(); ++i) {
@@ -339,7 +351,7 @@ bool Problem::CheckOrdering() {
     return true;
 }
 
-
+#ifdef USE_OPENMP
 void Problem::MakeHessian_parallel() {
     TicToc t_h;
     // 直接构造大的 H 矩阵
@@ -358,18 +370,26 @@ void Problem::MakeHessian_parallel() {
 
     // TODO:: accelate, accelate, accelate
 
+    std::shared_ptr<Edge> edge_ptr_list[edges_.size()];
+    int thisCnt = 0;
+    for (auto &edge: edges_) 
+    {
+        edge_ptr_list[thisCnt++] = edge.second;
+    }
+
     #pragma omp parallel for num_threads(NUM_THREADS)
-    for (auto edge = edges_.cbegin(); edge != edges_.cend(); ++edge) {
-    //for (auto &edge: edges_) {
+    
+    for (int index = 0; index < thisCnt ; index++) {
+        std::shared_ptr<Edge> edge_ptr = edge_ptr_list[index];
 
         int thread_id = omp_get_thread_num();
 
-        edge->second->ComputeResidual();
-        edge->second->ComputeJacobians();
+        edge_ptr->ComputeResidual();
+        edge_ptr->ComputeJacobians();
 
         // TODO:: robust cost
-        auto jacobians = edge->second->Jacobians();
-        auto verticies = edge->second->Verticies();
+        auto jacobians = edge_ptr->Jacobians();
+        auto verticies = edge_ptr->Verticies();
         assert(jacobians.size() == verticies.size());
         for (size_t i = 0; i < verticies.size(); ++i) {
             auto v_i = verticies[i];
@@ -381,8 +401,8 @@ void Problem::MakeHessian_parallel() {
 
             // 鲁棒核函数会修改残差和信息矩阵，如果没有设置 robust cost function，就会返回原来的
             double drho;
-            MatXX robustInfo(edge->second->Information().rows(),edge->second->Information().cols());
-            edge->second->RobustInfo(drho,robustInfo);
+            MatXX robustInfo(edge_ptr->Information().rows(),edge_ptr->Information().cols());
+            edge_ptr->RobustInfo(drho,robustInfo);
 
             MatXX JtW = jacobian_i.transpose() * robustInfo;
             for (size_t j = i; j < verticies.size(); ++j) {
@@ -405,7 +425,7 @@ void Problem::MakeHessian_parallel() {
 
                 }
             }
-            b[thread_id].segment(index_i, dim_i).noalias() -= drho * jacobian_i.transpose()* edge->second->Information() * edge->second->Residual();
+            b[thread_id].segment(index_i, dim_i).noalias() -= drho * jacobian_i.transpose()* edge_ptr->Information() * edge_ptr->Residual();
         }
 
     }
@@ -413,7 +433,7 @@ void Problem::MakeHessian_parallel() {
     for(size_t i=0; i<NUM_THREADS; i++)
     {
         Hessian_ += H[i];
-        b_ -= b[i];
+        b_ += b[i];
     }
     
     t_hessian_cost_ += t_h.toc();
@@ -443,7 +463,7 @@ void Problem::MakeHessian_parallel() {
 
 
 }
-
+#endif
 
 void Problem::MakeHessian() {
     TicToc t_h;
