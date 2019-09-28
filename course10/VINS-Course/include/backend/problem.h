@@ -206,9 +206,12 @@ private:
     double t_hessian_cost_ = 0.0;
     double t_PCGsovle_cost_ = 0.0;
 
+
+    /******************* 修改 ******************/
     //dogleg
     double radius_ = 0.0;
     double dogleg_step_norm_ = 0.0;
+    /******************* 修改 ******************/
 };
 
 }

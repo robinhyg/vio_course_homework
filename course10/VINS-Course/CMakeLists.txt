@@ -60,8 +60,9 @@ ADD_LIBRARY(MyVio SHARED
 
     src/backend/vertex.cc
     src/backend/edge.cc
-    src/backend/problem_dogleg.cc
     # src/backend/problem_lm.cc
+    # src/backend/problem_lm2.cc
+    src/backend/problem_dogleg.cc
     src/backend/vertex_pose.cc
     src/backend/edge_reprojection.cc
     src/backend/edge_imu.cc

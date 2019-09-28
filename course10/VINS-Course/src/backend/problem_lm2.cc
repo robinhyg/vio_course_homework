@@ -5,17 +5,13 @@
 #include "backend/problem.h"
 #include "utility/tic_toc.h"
 
-/******************* 修改 ******************/
-#define USE_OPENMP
-
 #ifdef USE_OPENMP
+
 #include <omp.h>
+
 #endif
-/******************* 修改 ******************/
 
 using namespace std;
-
-const int NUM_THREADS = 8;
 
 // define the format you want, you only need one instance of this...
 const static Eigen::IOFormat CSVFormat(Eigen::StreamPrecision, Eigen::DontAlignCols, ", ", "\n");
@@ -178,26 +174,11 @@ bool Problem::Solve(int iterations) {
         return false;
     }
 
-    bool GNcomputed;
-    VecX sd_step;
-    VecX gn_step;
-    VecX dogleg_step;
-
     TicToc t_solve;
     // 统计优化变量的维数，为构建 H 矩阵做准备
     SetOrdering();
     // 遍历edge, 构建 H 矩阵
-
-    /******************* 修改 ******************/
-    #ifdef USE_OPENMP
-    MakeHessian_parallel();
-    #endif
-
-    #ifndef USE_OPENMP
     MakeHessian();
-    #endif
-    /******************* 修改 ******************/
-
     // LM 初始化
     ComputeLambdaInit();
     // LM 算法迭代求解
@@ -205,88 +186,43 @@ bool Problem::Solve(int iterations) {
     int iter = 0;
     double last_chi_ = 1e20;
     while (!stop && (iter < iterations)) {
-        std::cout << "iter: " << iter << " , chi= " << currentChi_ << " , radius= " << radius_ << std::endl;
+        std::cout << "iter: " << iter << " , chi= " << currentChi_ << " , Lambda= " << currentLambda_ << std::endl;
         bool oneStepSuccess = false;
         int false_cnt = 0;
-
-        sd_step = (b_.transpose()*b_).value()/(b_.transpose()*Hessian_*b_).value() * b_;
-        GNcomputed = false;
-
-        while (!oneStepSuccess && false_cnt < 10)  // 不断尝试, 直到成功迭代一步
+        while (!oneStepSuccess && false_cnt < 10)  // 不断尝试 Lambda, 直到成功迭代一步
         {
-            /******************* 修改 ******************/
-            const double sd_step_norm = sd_step.norm();
-            if(sd_step_norm >= radius_)
-            {
-                dogleg_step = (radius_/sd_step_norm) * sd_step;
-            }
-            else
-            {
-                if(!GNcomputed)
-                {
-                    SolveLinearSystem();
-                    gn_step = delta_x_;
-                    GNcomputed = true;
-                }
+            // setLambda
+//            AddLambdatoHessianLM();
+            // 第四步，解线性方程
+            SolveLinearSystem();
+            //
+//            RemoveLambdaHessianLM();
 
-                const double gn_step_norm = gn_step.norm();
-                if(gn_step_norm <= radius_)
-                {
-                    dogleg_step = gn_step;
-                }
-                else
-                {
-                    // a = sd_step
-                    // b = gauss_newton_step
-                    const double b_dot_a = sd_step.dot(gn_step);
-                    const double a_squared_norm = pow(sd_step_norm, 2.0);
-                    const double b_minus_a_squared_norm =
-                        a_squared_norm - 2 * b_dot_a + pow(gn_step_norm, 2);
-
-                    // c = a' (b - a)
-                    //   = sd_step' gn_step_ - sd_step^2
-                    const double c = b_dot_a - a_squared_norm;
-                    const double d = sqrt(c * c + b_minus_a_squared_norm *
-                                            (pow(radius_, 2.0) - a_squared_norm));
-
-                    double beta =
-                        (c <= 0)
-                        ? (d - c) /  b_minus_a_squared_norm
-                        : (radius_ * radius_ - a_squared_norm) / (d + c);
-                    dogleg_step = (1.0 - beta) * sd_step + beta * gn_step;
-                }
-            }
-            dogleg_step_norm_ = dogleg_step.norm();
-
-            delta_x_ = dogleg_step;
-            /******************* 修改 ******************/
+            // 优化退出条件1： delta_x_ 很小则退出
+//            if (delta_x_.squaredNorm() <= 1e-6 || false_cnt > 10)
+            // TODO:: 退出条件还是有问题, 好多次误差都没变化了，还在迭代计算，应该搞一个误差不变了就中止
+//            if ( false_cnt > 10)
+//            {
+//                stop = true;
+//                break;
+//            }
 
             // 更新状态量
             UpdateStates();
-            // 判断当前步是否可行以及 LM 的 lambda 怎么更新, chi2 也计算一下
 
+            // 判断当前步是否可行以及 LM 的 lambda 怎么更新, chi2 也计算一下
 
             /******************* 内部修改了IsGoodStep() ******************/
             oneStepSuccess = IsGoodStep();
             /******************* 内部修改了IsGoodStep() ******************/
-
-
+            
+            
             // 后续处理，
             if (oneStepSuccess) {
 //                std::cout << " get one step success\n";
 
                 // 在新线性化点 构建 hessian
-
-                /******************* 修改 ******************/
-                #ifdef USE_OPENMP
-                MakeHessian_parallel();
-                #endif
-
-                #ifndef USE_OPENMP
                 MakeHessian();
-                #endif
-                /******************* 修改 ******************/
-
                 // TODO:: 这个判断条件可以丢掉，条件 b_max <= 1e-12 很难达到，这里的阈值条件不应该用绝对值，而是相对值
 //                double b_max = 0.0;
 //                for (int i = 0; i < b_.size(); ++i) {
@@ -369,120 +305,6 @@ bool Problem::CheckOrdering() {
     }
     return true;
 }
-
-#ifdef USE_OPENMP
-void Problem::MakeHessian_parallel() {
-    TicToc t_h;
-    // 直接构造大的 H 矩阵
-    ulong size = ordering_generic_;
-
-    MatXX H[NUM_THREADS];
-    VecX b[NUM_THREADS];
-
-    for(size_t i=0; i<NUM_THREADS; i++)
-    {
-        H[i] = MatXX::Zero(size, size);
-        b[i] = VecX::Zero(size);
-    }
-    Hessian_ = MatXX::Zero(size, size);
-    b_ = VecX::Zero(size);
-
-    // TODO:: accelate, accelate, accelate
-
-    std::shared_ptr<Edge> edge_ptr_list[edges_.size()];
-    int thisCnt = 0;
-    for (auto &edge: edges_) 
-    {
-        edge_ptr_list[thisCnt++] = edge.second;
-    }
-
-    #pragma omp parallel for num_threads(NUM_THREADS)
-    
-    for (int index = 0; index < thisCnt ; index++) {
-        std::shared_ptr<Edge> edge_ptr = edge_ptr_list[index];
-
-        int thread_id = omp_get_thread_num();
-
-        edge_ptr->ComputeResidual();
-        edge_ptr->ComputeJacobians();
-
-        // TODO:: robust cost
-        auto jacobians = edge_ptr->Jacobians();
-        auto verticies = edge_ptr->Verticies();
-        assert(jacobians.size() == verticies.size());
-        for (size_t i = 0; i < verticies.size(); ++i) {
-            auto v_i = verticies[i];
-            if (v_i->IsFixed()) continue;    // Hessian 里不需要添加它的信息，也就是它的雅克比为 0
-
-            auto jacobian_i = jacobians[i];
-            ulong index_i = v_i->OrderingId();
-            ulong dim_i = v_i->LocalDimension();
-
-            // 鲁棒核函数会修改残差和信息矩阵，如果没有设置 robust cost function，就会返回原来的
-            double drho;
-            MatXX robustInfo(edge_ptr->Information().rows(),edge_ptr->Information().cols());
-            edge_ptr->RobustInfo(drho,robustInfo);
-
-            MatXX JtW = jacobian_i.transpose() * robustInfo;
-            for (size_t j = i; j < verticies.size(); ++j) {
-                auto v_j = verticies[j];
-
-                if (v_j->IsFixed()) continue;
-
-                auto jacobian_j = jacobians[j];
-                ulong index_j = v_j->OrderingId();
-                ulong dim_j = v_j->LocalDimension();
-
-                assert(v_j->OrderingId() != -1);
-                MatXX hessian = JtW * jacobian_j;
-
-                // 所有的信息矩阵叠加起来
-                H[thread_id].block(index_i, index_j, dim_i, dim_j).noalias() += hessian;
-                if (j != i) {
-                    // 对称的下三角
-                    H[thread_id].block(index_j, index_i, dim_j, dim_i).noalias() += hessian.transpose();
-
-                }
-            }
-            b[thread_id].segment(index_i, dim_i).noalias() -= drho * jacobian_i.transpose()* edge_ptr->Information() * edge_ptr->Residual();
-        }
-
-    }
-
-    for(size_t i=0; i<NUM_THREADS; i++)
-    {
-        Hessian_ += H[i];
-        b_ += b[i];
-    }
-    
-    t_hessian_cost_ += t_h.toc();
-
-    if(H_prior_.rows() > 0)
-    {
-        MatXX H_prior_tmp = H_prior_;
-        VecX b_prior_tmp = b_prior_;
-
-        /// 遍历所有 POSE 顶点，然后设置相应的先验维度为 0 .  fix 外参数, SET PRIOR TO ZERO
-        /// landmark 没有先验
-        for (auto vertex: verticies_) {
-            if (IsPoseVertex(vertex.second) && vertex.second->IsFixed() ) {
-                int idx = vertex.second->OrderingId();
-                int dim = vertex.second->LocalDimension();
-                H_prior_tmp.block(idx,0, dim, H_prior_tmp.cols()).setZero();
-                H_prior_tmp.block(0,idx, H_prior_tmp.rows(), dim).setZero();
-                b_prior_tmp.segment(idx,dim).setZero();
-//                std::cout << " fixed prior, set the Hprior and bprior part to zero, idx: "<<idx <<" dim: "<<dim<<std::endl;
-            }
-        }
-        Hessian_.topLeftCorner(ordering_poses_, ordering_poses_) += H_prior_tmp;
-        b_.head(ordering_poses_) += b_prior_tmp;
-    }
-
-    delta_x_ = VecX::Zero(size);  // initial delta_x = 0_n;
-
-
-}
-#endif
 
 void Problem::MakeHessian() {
     TicToc t_h;
@@ -581,9 +403,9 @@ void Problem::SolveLinearSystem() {
     if (problemType_ == ProblemType::GENERIC_PROBLEM) {
         // PCG solver
         MatXX H = Hessian_;
-        // for (size_t i = 0; i < Hessian_.cols(); ++i) {
-        //     H(i, i) += currentLambda_;
-        // }
+        for (size_t i = 0; i < Hessian_.cols(); ++i) {
+            H(i, i) += currentLambda_;
+        }
         // delta_x_ = PCGSolver(H, b_, H.rows() * 2);
         delta_x_ = H.ldlt().solve(b_);
 
@@ -615,9 +437,9 @@ void Problem::SolveLinearSystem() {
         // step2: solve Hpp * delta_x = bpp
         VecX delta_x_pp(VecX::Zero(reserve_size));
 
-        // for (ulong i = 0; i < ordering_poses_; ++i) {
-        //     H_pp_schur_(i, i) += currentLambda_;              // LM Method
-        // }
+        for (ulong i = 0; i < ordering_poses_; ++i) {
+            H_pp_schur_(i, i) += currentLambda_;              // LM Method
+        }
 
         // TicToc t_linearsolver;
         delta_x_pp =  H_pp_schur_.ldlt().solve(b_pp_schur_);//  SVec.asDiagonal() * svd.matrixV() * Ub;    
@@ -679,8 +501,9 @@ void Problem::RollbackStates() {
 
 /// LM
 void Problem::ComputeLambdaInit() {
+    ni_ = 2.;
+    currentLambda_ = -1.;
     currentChi_ = 0.0;
-    radius_ = 1.0;
 
     for (auto edge: edges_) {
         currentChi_ += edge.second->RobustChi2();
@@ -691,6 +514,17 @@ void Problem::ComputeLambdaInit() {
 
     stopThresholdLM_ = 1e-10 * currentChi_;          // 迭代条件为 误差下降 1e-6 倍
 
+    double maxDiagonal = 0;
+    ulong size = Hessian_.cols();
+    assert(Hessian_.rows() == Hessian_.cols() && "Hessian is not square");
+    for (ulong i = 0; i < size; ++i) {
+        maxDiagonal = std::max(fabs(Hessian_(i, i)), maxDiagonal);
+    }
+
+    maxDiagonal = std::min(5e10, maxDiagonal);
+    double tau = 1e-5;  // 1e-5
+    currentLambda_ = tau * maxDiagonal;
+//        std::cout << "currentLamba_: "<<maxDiagonal<<" "<<currentLambda_<<std::endl;
 }
 
 void Problem::AddLambdatoHessianLM() {
@@ -711,11 +545,6 @@ void Problem::RemoveLambdaHessianLM() {
 }
 
 bool Problem::IsGoodStep() {
-    double scale = 0;
-//    scale = 0.5 * delta_x_.transpose() * (currentLambda_ * delta_x_ + b_);
-//    scale += 1e-3;    // make sure it's non-zero :)
-    scale = 0.5* delta_x_.transpose() * (2*b_ - Hessian_ * delta_x_);
-    scale += 1e-6;    // make sure it's non-zero :)
 
     // recompute residuals after update state
     double tempChi = 0.0;
@@ -727,24 +556,28 @@ bool Problem::IsGoodStep() {
         tempChi += err_prior_.squaredNorm();
     tempChi *= 0.5;          // 1/2 * err^2
 
-    double rho = (currentChi_ - tempChi) / scale;
+    double factor1 = (b_.transpose()*delta_x_).value();
+    double alpha = factor1 / ( (tempChi - currentChi_)/2. + 2.*factor1 );
 
-    if (rho < 0.25) 
-    {
-        radius_ *= 0.5;
-    }
-    if (rho > 0.75) {
-        radius_ = std::max(radius_, 3.0 * dogleg_step_norm_);
-    }
-    
+    //
+    RollbackStates();
+    delta_x_ *= alpha;
+    UpdateStates();
+
+    double scale = 0;
+//    scale = 0.5 * delta_x_.transpose() * (currentLambda_ * delta_x_ + b_);
+//    scale += 1e-3;    // make sure it's non-zero :)
+    scale = 0.5* delta_x_.transpose() * (currentLambda_ * delta_x_ + b_);
+    scale += 1e-6;    // make sure it's non-zero :)
+
+    double rho = (currentChi_ - tempChi) / scale;
     if (rho > 0 && isfinite(tempChi))   // last step was good, 误差在下降
     {
+        currentLambda_ = (std::max)(1e-7, currentLambda_ / (1. + alpha));
         currentChi_ = tempChi;
         return true;
-    } 
-    else 
-    {
-        
+    } else {
+        currentLambda_ += std::abs(tempChi - currentChi_) / (2. * alpha);
         return false;
     }
 }
